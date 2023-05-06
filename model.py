@@ -4,12 +4,13 @@ import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
+from einops.layers.torcch import Rearrange
 import math
 import numpy as np
 import time
 from torch import einsum
 
+from timm.models.registry import register_model
 
 class FastLeFF(nn.Module):
     
@@ -727,9 +728,54 @@ def window_reverse(windows, win_size, H, W, dilation_rate=1):
 
 #########################################
 # Downsample Block
+
+
+class Block(nn.Module):
+    r""" ConvNeXt Block. There are two equivalent implementations:
+    (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
+    (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
+    We use (2) as we find it slightly faster in PyTorch
+    
+    Args:
+        dim (int): Number of input channels.
+        drop_path (float): Stochastic depth rate. Default: 0.0
+        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
+    """
+    def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6):
+        super().__init__()
+        
+        
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim) # depthwise conv
+        self.norm = LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, 4 * dim) # pointwise/1x1 convs, implemented with linear layers
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(4 * dim, dim)
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)), 
+                                    requires_grad=True) if layer_scale_init_value > 0 else None
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x):
+        input = x
+        x = self.dwconv(x)
+        x = x.permute(0, 2, 3, 1) # (N, C, H, W) -> (N, H, W, C)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma * x
+        x = x.permute(0, 3, 1, 2) # (N, H, W, C) -> (N, C, H, W)
+
+        x = input + self.drop_path(x)
+        return x
+
+
+
+
 class Downsample(nn.Module):
     def __init__(self, in_channel, out_channel):
         super(Downsample, self).__init__()
+        self.convnext = Block(in_channel)
         self.conv = nn.Sequential(
             nn.Conv2d(in_channel, out_channel, kernel_size=4, stride=2, padding=1),
         )
@@ -742,7 +788,10 @@ class Downsample(nn.Module):
         H = int(math.sqrt(L))
         W = int(math.sqrt(L))
         x = x.transpose(1, 2).contiguous().view(B, C, H, W)
-        out = self.conv(x).flatten(2).transpose(1,2).contiguous()  # B H*W C
+        x = self.convnext(x)
+        out = self.conv(x)
+        out = out.flatten(2)
+        out = out.transpose(1,2).contiguous()  # B H*W C
         return out
 
     def flops(self, H, W):
